@@ -5,7 +5,7 @@ recommendation model that combines **Shapley value-based context feature weighti
 with **Choquet integral-based neighbor selection (CINS)**, together with all the
 scripts used for the experiments reported in the paper.
 
-> *[Paper title]*, [Authors], [Journal/Conference, Year]. [DOI/link to be added upon publication]
+
 
 ## Method overview
 
@@ -87,7 +87,6 @@ to the output file configured at the top of the class.
 |---|---|---|
 | `SHAPLEY_SAMPLES` (T) | 200 | sampled training instances (Step 1) |
 | `SHAPLEY_ITER` (K) | 30 | permutations per instance (Step 1) |
-| `EPSILON_1` | 0.0 | CTXFeatSim threshold (Step 2; 0 = keep all co-raters) |
 | `EPSILON` (ε) | ≈ 1/N | CINS Choquet relevance threshold (Step 3) |
 | Gradient descent | 100 iterations, η = 0.05/M | local Sugeno density fitting |
 | Evaluation | 10 seeds × 5-fold CV | relevance threshold: rating ≥ 4 (1–5 scale) |
