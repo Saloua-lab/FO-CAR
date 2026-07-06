@@ -1,0 +1,761 @@
+package Amazon;
+
+import java.io.*;
+import java.util.*;
+import java.util.zip.GZIPInputStream;
+
+/**
+ * FO-CAR Amazon-Books – .
+ *
+ * Pipeline:
+ *   Step 1 – Shapley-based context feature weighting   (step1_computeShapley)
+ *   Step 2 – Neighborhood generation via CTXFeatSim     (step2_generateNeighborhood)
+ *   Step 3 – Choquet Integral-based Neighbor Selection  (step3_cinsSelect)
+ *
+ * Dataset: Kaggle "Amazon Books Reviews" -- Books_rating.csv (real CSV, not
+ * McAuley JSON lines): Id,Title,Price,User_id,profileName,review/helpfulness,
+ * review/score,review/time,review/summary,review/text. books_data.csv (book
+ * metadata) is NOT used here -- no genre/category context, by design choice.
+ *
+ * Unlike the other FO-CAR datasets, Amazon reviews have no built-in
+ * situational context, so this file DERIVES 4 context dimensions from
+ * fields present in Books_rating.csv itself:
+ *
+ *   1. season       -- from review/time's month: Winter=1,Spring=2,Summer=3,Fall=4
+ *   2. daytype      -- from review/time's day-of-week: Weekday=1, Weekend=2
+ *   3. helpfulness  -- bucketed review/helpfulness ("x/y" string) ratio: Low=1,Medium=2,High=3
+ *                      (proxy for "social endorsement", in the spirit of LDOS's "social" dim)
+ *   4. reviewLength -- bucketed review/summary+review/text character length: Short=1,Medium=2,Long=3
+ *                      (proxy for reviewer engagement/effort)
+ *
+ * (This dataset has no "verified purchase" field, unlike the McAuley Amazon
+ * format used elsewhere in this directory, so that dimension is dropped
+ * rather than fabricated.)
+ *
+ * Column lookup is by HEADER NAME (not fixed position), read from the first
+ * CSV row -- robust to column reordering, as long as the names above match.
+ * User_id/Title are strings; loadData() encodes them to dense ints the same
+ * way Food_v2's string-context encoder does for context values.
+ *
+ * CSV parsing handles quoted fields with embedded commas/newlines (review
+ * text commonly contains both) -- see readCsvRecords(). DATA_CSV may point
+ * to a plain .csv or a .csv.gz (gzip auto-detected by the ".gz" extension).
+ */
+public class RecomMain2_FOCAR_AmazonBooks_v1 {
+
+    static String DATA_CSV = "D:\\datasets\\Books_rating.csv"; // or "Books_rating.csv.gz"
+    static String OUT_FILE = "AmazonBooks_FOCARS_CV.txt";
+
+    static int    K_FOLDS  = 5;
+    static int    NB_RUNS  = 10;
+    static long[] seeds    = {1,2,3,4,5,6,7,8,9,10};
+    static int    N_DIMS   = 4;
+    static int    NEG_SAMPLE       = 1000;
+    static int    RATING_THRESHOLD = 4;  // >=4 out of 5
+
+    static int    SHAPLEY_ITER    = 30;
+    static int    SHAPLEY_SAMPLES = 200;
+
+    static double EPSILON_1 = 0.0;
+    static double EPSILON   = 0.5;
+
+    static float  DEFAULT_MEAN = 3.5f;
+    static int    RATING_MAX   = 5;
+
+    static double SUBSAMPLE_FRACTION = 1.0; // 1.0 = no subsampling, use for final numbers
+
+    private static double[] lastMetrics;
+
+    // ══════════════════════════════════════════════════════════════════
+    //  MAIN
+    // ══════════════════════════════════════════════════════════════════
+    public static void main(String[] args) throws Exception {
+        System.out.println("=== FO-CAR Amazon-Books (derived context) ===\n");
+        ArrayList<int[]> allRows = loadData(DATA_CSV);
+        System.out.println("Total rows: " + allRows.size());
+
+        if (SUBSAMPLE_FRACTION < 1.0) {
+            Collections.shuffle(allRows, new Random(0));
+            int keep = (int) Math.round(allRows.size() * SUBSAMPLE_FRACTION);
+            allRows = new ArrayList<int[]>(allRows.subList(0, keep));
+            System.out.println("Subsampled to: " + allRows.size() + " rows ("
+                + (SUBSAMPLE_FRACTION * 100) + "% -- smoke test TREND only, not headline numbers)");
+        }
+
+        Set<Integer> allItemSet = new HashSet<Integer>();
+        for (int[] r : allRows) allItemSet.add(r[1]);
+        ArrayList<Integer> allItems = new ArrayList<Integer>(allItemSet);
+        System.out.println("Items: " + allItems.size());
+
+        double[][] allM = new double[NB_RUNS][10];
+        for (int r = 0; r < NB_RUNS; r++) {
+            int seed = (int) seeds[r];
+            ArrayList<int[]> shuffled = new ArrayList<int[]>(allRows);
+            Collections.shuffle(shuffled, new Random(seed));
+            int fs = shuffled.size() / K_FOLDS;
+            double[] seedM = new double[10];
+            for (int f = 1; f <= K_FOLDS; f++) {
+                int s = (f-1)*fs, e = (f == K_FOLDS) ? shuffled.size() : s+fs;
+                ArrayList<int[]> test  = new ArrayList<int[]>(shuffled.subList(s, e));
+                ArrayList<int[]> train = new ArrayList<int[]>(shuffled.subList(0, s));
+                if (e < shuffled.size()) train.addAll(shuffled.subList(e, shuffled.size()));
+                evalFold(train, test, allItems, seed, f);
+                for (int m = 0; m < 10; m++) seedM[m] += lastMetrics[m];
+            }
+            for (int m = 0; m < 10; m++) { seedM[m] /= K_FOLDS; allM[r][m] = seedM[m]; }
+            System.out.printf("SEED=%d MAE=%.4f [FullCtx=%.4f] P@5=%.4f P@10=%.4f R@5=%.4f R@10=%.4f N@5=%.4f N@10=%.4f%n%n",
+                seed, seedM[0], seedM[8], seedM[2], seedM[3], seedM[4], seedM[5], seedM[6], seedM[7]);
+        }
+
+        System.out.println("\n=== RESULTS ===");
+        String[] names = {"MAE","RMSE","Prec@5","Prec@10","Rec@5","Rec@10","NDCG@5","NDCG@10",
+                          "MAE_FullCtx","RMSE_FullCtx"};
+        StringBuilder sb = new StringBuilder("=== FO-CAR Amazon-Books RESULTS ===\n");
+        for (int m = 0; m < 10; m++) {
+            double[] col = new double[NB_RUNS];
+            for (int r = 0; r < NB_RUNS; r++) col[r] = allM[r][m];
+            String line = String.format("  %-14s = %.6f +/- %.6f%n", names[m], mean(col), std(col));
+            System.out.print(line);
+            sb.append(line);
+        }
+        PrintWriter pw = new PrintWriter(new FileWriter(OUT_FILE));
+        pw.print(sb.toString());
+        pw.close();
+        System.out.println("\nResults saved to " + OUT_FILE);
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  FOLD EVALUATION
+    // ══════════════════════════════════════════════════════════════════
+    private static void evalFold(ArrayList<int[]> train, ArrayList<int[]> test,
+                                  ArrayList<Integer> allItems, int seed, int fold) {
+        long t0 = System.currentTimeMillis();
+
+        // Built from TRAIN ONLY: uir feeds pearsonSim's neighbor-similarity
+        // calculation, and candidate neighbors are drawn from itemIdx (also
+        // train-only) for the exact item being predicted. Including test
+        // rows here would leak a target user's own held-out rating for that
+        // item into the "common items" overlap used to compute similarity
+        // to each candidate, inflating the similarity of whichever neighbor
+        // happens to already be close to the true answer.
+        Map<Long, float[]> pairAcc = new HashMap<Long, float[]>();
+        for (int[] s : train) {
+            long key = (long) s[0] * 1000000 + s[1];
+            float[] a = pairAcc.get(key);
+            if (a == null) { a = new float[]{0, 0}; pairAcc.put(key, a); }
+            a[0] += s[2]; a[1]++;
+        }
+        Map<Integer, Map<Integer, Float>> uir = new HashMap<Integer, Map<Integer, Float>>();
+        for (Map.Entry<Long, float[]> e : pairAcc.entrySet()) {
+            int uid = (int)(e.getKey() / 1000000), iid = (int)(e.getKey() % 1000000);
+            Map<Integer, Float> m = uir.get(uid);
+            if (m == null) { m = new HashMap<Integer, Float>(); uir.put(uid, m); }
+            m.put(iid, e.getValue()[0] / e.getValue()[1]);
+        }
+        Map<Integer, Float> uMeans = new HashMap<Integer, Float>();
+        float gSum = 0; int gN = 0;
+        for (Map.Entry<Integer, Map<Integer, Float>> e : uir.entrySet()) {
+            float s = 0; int c = 0;
+            for (float v : e.getValue().values()) { s += v; c++; }
+            float m = (c > 0) ? s/c : DEFAULT_MEAN;
+            uMeans.put(e.getKey(), m); gSum += m; gN++;
+        }
+        float gMean = (gN > 0) ? gSum / gN : DEFAULT_MEAN;
+
+        Map<Integer, ArrayList<int[]>> itemIdx = new HashMap<Integer, ArrayList<int[]>>();
+        for (int[] r : train) {
+            ArrayList<int[]> l = itemIdx.get(r[1]);
+            if (l == null) { l = new ArrayList<int[]>(); itemIdx.put(r[1], l); }
+            l.add(r);
+        }
+        Map<Integer, Set<Integer>> userTrainItems = new HashMap<Integer, Set<Integer>>();
+        for (int[] r : train) {
+            Set<Integer> s = userTrainItems.get(r[0]);
+            if (s == null) { s = new HashSet<Integer>(); userTrainItems.put(r[0], s); }
+            s.add(r[1]);
+        }
+
+        float[] shapley = step1_computeShapley(itemIdx, uMeans, gMean);
+        double[] g = new double[N_DIMS];
+        float sumS = 0;
+        for (int d = 0; d < N_DIMS; d++) sumS += Math.max(0, shapley[d]);
+        for (int d = 0; d < N_DIMS; d++)
+            g[d] = (sumS > 0) ? Math.max(0.001, shapley[d]) / sumS : 1.0 / N_DIMS;
+
+        float sumAbs = 0, sumSq = 0; int nPred = 0;
+        for (int[] tst : test) {
+            float real = tst[2];
+            float pred = predict(tst[0], tst[1], tst, itemIdx, uir, uMeans, gMean, g);
+            sumAbs += Math.abs(pred - real); sumSq += (pred - real)*(pred - real); nPred++;
+        }
+        float mae  = (nPred > 0) ? sumAbs / nPred : 0;
+        float rmse = (nPred > 0) ? (float) Math.sqrt(sumSq / nPred) : 0;
+
+        boolean[] allDims = new boolean[N_DIMS];
+        Arrays.fill(allDims, true);
+        float sumAbsFC = 0, sumSqFC = 0;
+        for (int[] tst : test) {
+            float pred = predictForShapley(tst, allDims, itemIdx, uMeans, gMean);
+            sumAbsFC += Math.abs(pred - tst[2]);
+            sumSqFC  += (pred - tst[2]) * (pred - tst[2]);
+        }
+        float maeFC  = (nPred > 0) ? sumAbsFC / nPred : 0;
+        float rmseFC = (nPred > 0) ? (float) Math.sqrt(sumSqFC / nPred) : 0;
+
+        Map<Integer, ArrayList<int[]>> userTest = new HashMap<Integer, ArrayList<int[]>>();
+        for (int[] t : test) {
+            ArrayList<int[]> l = userTest.get(t[0]);
+            if (l == null) { l = new ArrayList<int[]>(); userTest.put(t[0], l); }
+            l.add(t);
+        }
+        Random rng = new Random(seed * 1000 + fold);
+        double sP5=0, sP10=0, sR5=0, sR10=0, sN5=0, sN10=0;
+        int nUsers = 0;
+        for (Map.Entry<Integer, ArrayList<int[]>> ue : userTest.entrySet()) {
+            int uid = ue.getKey();
+            ArrayList<int[]> testSits = ue.getValue();
+            ArrayList<int[]> posSits = new ArrayList<int[]>();
+            for (int[] t : testSits) if (t[2] >= RATING_THRESHOLD) posSits.add(t);
+            if (posSits.isEmpty()) continue;
+            Set<Integer> relSet = new HashSet<Integer>();
+            for (int[] t : posSits) relSet.add(t[1]);
+            Set<Integer> knownItems = new HashSet<Integer>();
+            if (userTrainItems.containsKey(uid)) knownItems.addAll(userTrainItems.get(uid));
+            for (int[] t : testSits) knownItems.add(t[1]);
+            Set<Integer> negItems = new HashSet<Integer>();
+            int attempts = 0;
+            while (negItems.size() < NEG_SAMPLE && attempts < NEG_SAMPLE * 20) {
+                int negIid = allItems.get(rng.nextInt(allItems.size()));
+                if (!knownItems.contains(negIid)) negItems.add(negIid);
+                attempts++;
+            }
+            int[] repSit = posSits.get(0);
+            ArrayList<float[]> rawScored = new ArrayList<float[]>();
+            for (int[] sit : posSits) {
+                float score = predict(uid, sit[1], sit, itemIdx, uir, uMeans, gMean, g);
+                rawScored.add(new float[]{sit[1], score, 1f});
+            }
+            for (int negIid : negItems) {
+                float score = predict(uid, negIid, repSit, itemIdx, uir, uMeans, gMean, g);
+                rawScored.add(new float[]{negIid, score, 0f});
+            }
+            // Deduplicate by item ID: the same book title can span multiple
+            // editions/ISBNs a user rated separately, so the same item ID can
+            // appear more than once in posSits. Without this, precAtK/recAtK
+            // can double-count a single item and push Rec@K above 1.0. Keep
+            // the highest-scored entry per item, matching the convention used
+            // in the other dataset pipelines (LDOS/InCar/Food/RichML).
+            Map<Integer, float[]> bestByItem = new LinkedHashMap<Integer, float[]>();
+            for (float[] entry : rawScored) {
+                int iid = (int) entry[0];
+                if (!bestByItem.containsKey(iid) || entry[1] > bestByItem.get(iid)[1])
+                    bestByItem.put(iid, entry);
+            }
+            ArrayList<float[]> scored = new ArrayList<float[]>(bestByItem.values());
+            Collections.sort(scored, new Comparator<float[]>() {
+                public int compare(float[] a, float[] b) { return Float.compare(b[1], a[1]); }
+            });
+            sP5  += precAtK(scored, relSet, 5);
+            sP10 += precAtK(scored, relSet, 10);
+            sR5  += recAtK(scored, relSet, 5);
+            sR10 += recAtK(scored, relSet, 10);
+            sN5  += ndcgAtK(scored, relSet, 5);
+            sN10 += ndcgAtK(scored, relSet, 10);
+            nUsers++;
+        }
+        if (nUsers == 0) nUsers = 1;
+        lastMetrics = new double[]{mae, rmse,
+            sP5/nUsers, sP10/nUsers,
+            sR5/nUsers, sR10/nUsers,
+            sN5/nUsers, sN10/nUsers,
+            maeFC, rmseFC};
+
+        long dt = System.currentTimeMillis() - t0;
+        System.out.printf(Locale.US, "SEED=%d FOLD=%d MAE=%.4f [FullCtx=%.4f] RMSE=%.4f P@5=%.4f R@5=%.4f (%ds)%n",
+            seed, fold, mae, maeFC, rmse, (float)(sP5/nUsers), (float)(sR5/nUsers), dt/1000);
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  PREDICTION
+    // ══════════════════════════════════════════════════════════════════
+    private static float predict(int uid, int iid, int[] sit,
+            Map<Integer, ArrayList<int[]>> itemIdx,
+            Map<Integer, Map<Integer, Float>> uir,
+            Map<Integer, Float> uMeans, float gMean, double[] g) {
+        float uMean = uMeans.containsKey(uid) ? uMeans.get(uid) : gMean;
+        int[] ctx = new int[N_DIMS];
+        Arrays.fill(ctx, -1);
+        if (sit != null)
+            for (int d = 0; d < N_DIMS; d++)
+                if (3 + d < sit.length) ctx[d] = sit[3 + d];
+        ArrayList<int[]> candidates = step2_generateNeighborhood(iid, ctx, g, itemIdx);
+        if (candidates.isEmpty()) return Math.max(1, Math.min(RATING_MAX, uMean));
+        float[] agg = step3_cinsSelect(uid, ctx, candidates, uir, uMeans, gMean, g);
+        float sumW = agg[0], sumWR = agg[1]; int numN = (int) agg[2];
+        float pred = (numN > 0 && sumW > 0) ? uMean + sumWR / sumW : uMean;
+        return Math.max(1, Math.min(RATING_MAX, pred));
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  STEP 1 – Shapley-based context feature weighting
+    // ══════════════════════════════════════════════════════════════════
+    private static float[] step1_computeShapley(
+            Map<Integer, ArrayList<int[]>> itemIdx,
+            Map<Integer, Float> uMeans, float gMean) {
+        Random rng = new Random(42);
+        ArrayList<int[]> pool = new ArrayList<int[]>();
+        for (ArrayList<int[]> sits : itemIdx.values()) pool.addAll(sits);
+        Collections.shuffle(pool, rng);
+        int nSamp = Math.min(SHAPLEY_SAMPLES, pool.size());
+        ArrayList<int[]> samples = new ArrayList<int[]>(pool.subList(0, nSamp));
+        double[] baseErr = new double[nSamp];
+        for (int s = 0; s < nSamp; s++) {
+            int[] row = samples.get(s);
+            float uMean = uMeans.containsKey(row[0]) ? uMeans.get(row[0]) : gMean;
+            baseErr[s] = Math.abs(row[2] - uMean);
+        }
+        double[] shapleySum   = new double[N_DIMS];
+        double[] shapleyCount = new double[N_DIMS];
+        for (int iter = 0; iter < SHAPLEY_ITER; iter++) {
+            int[] perm = randomPerm(N_DIMS, rng);
+            int sSize  = rng.nextInt(N_DIMS);
+            boolean[] inS = new boolean[N_DIMS];
+            for (int k = 0; k < sSize; k++) inS[perm[k]] = true;
+            double[] vS = coalitionValues(samples, inS, itemIdx, uMeans, gMean, baseErr);
+            for (int j = 0; j < N_DIMS; j++) {
+                if (inS[j]) continue;
+                boolean[] inSj = Arrays.copyOf(inS, N_DIMS);
+                inSj[j] = true;
+                double[] vSj = coalitionValues(samples, inSj, itemIdx, uMeans, gMean, baseErr);
+                double marginal = 0;
+                for (int s = 0; s < nSamp; s++) marginal += vSj[s] - vS[s];
+                shapleySum[j]   += marginal / nSamp;
+                shapleyCount[j] += 1;
+            }
+        }
+        float[] w = new float[N_DIMS];
+        double maxPhi = 0;
+        for (int d = 0; d < N_DIMS; d++) {
+            if (shapleyCount[d] > 0) w[d] = (float)(shapleySum[d] / shapleyCount[d]);
+            if (w[d] > maxPhi) maxPhi = w[d];
+        }
+        if (maxPhi <= 0) { Arrays.fill(w, 1f / N_DIMS); return w; }
+        for (int d = 0; d < N_DIMS; d++)
+            w[d] = (float) Math.max(0.01, w[d] / maxPhi);
+        return w;
+    }
+
+    private static double[] coalitionValues(ArrayList<int[]> samples, boolean[] inS,
+            Map<Integer, ArrayList<int[]>> itemIdx,
+            Map<Integer, Float> uMeans, float gMean, double[] baseErr) {
+        double[] v = new double[samples.size()];
+        for (int s = 0; s < samples.size(); s++) {
+            float pred = predictForShapley(samples.get(s), inS, itemIdx, uMeans, gMean);
+            v[s] = baseErr[s] - Math.abs(samples.get(s)[2] - pred);
+        }
+        return v;
+    }
+
+    private static float predictForShapley(int[] sample, boolean[] inS,
+            Map<Integer, ArrayList<int[]>> itemIdx,
+            Map<Integer, Float> uMeans, float gMean) {
+        float uMean = uMeans.containsKey(sample[0]) ? uMeans.get(sample[0]) : gMean;
+        boolean anyActive = false;
+        for (boolean b : inS) if (b) { anyActive = true; break; }
+        if (!anyActive) return uMean;
+        ArrayList<int[]> cands = itemIdx.get(sample[1]);
+        if (cands == null || cands.isEmpty()) return uMean;
+        float sumR = 0; int cnt = 0;
+        for (int[] nb : cands) {
+            if (nb[0] == sample[0]) continue;
+            boolean match = true;
+            for (int d = 0; d < N_DIMS; d++) {
+                if (!inS[d]) continue;
+                if (sample[3+d] <= 0 || nb[3+d] <= 0 || sample[3+d] != nb[3+d]) { match = false; break; }
+            }
+            if (match) { sumR += nb[2]; cnt++; }
+        }
+        float pred = (cnt > 0) ? sumR / cnt : uMean;
+        return Math.max(1, Math.min(RATING_MAX, pred));
+    }
+
+    private static int[] randomPerm(int n, Random rng) {
+        int[] p = new int[n];
+        for (int i = 0; i < n; i++) p[i] = i;
+        for (int i = n-1; i > 0; i--) {
+            int j = rng.nextInt(i+1); int t = p[i]; p[i] = p[j]; p[j] = t;
+        }
+        return p;
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  STEP 2 – CTXFeatSim neighborhood filtering
+    // ══════════════════════════════════════════════════════════════════
+    private static ArrayList<int[]> step2_generateNeighborhood(
+            int iid, int[] ctx, double[] g,
+            Map<Integer, ArrayList<int[]>> itemIdx) {
+        ArrayList<int[]> all = itemIdx.get(iid);
+        if (all == null) return new ArrayList<int[]>();
+        if (EPSILON_1 <= 0) return all;
+        ArrayList<int[]> result = new ArrayList<int[]>();
+        for (int[] nb : all)
+            if (ctxFeatSim(ctx, nb, g) >= EPSILON_1) result.add(nb);
+        return result;
+    }
+
+    private static double ctxFeatSim(int[] ctx, int[] nb, double[] g) {
+        double num = 0, den = 0;
+        for (int d = 0; d < N_DIMS; d++) {
+            if (ctx[d] <= 0 || nb[3+d] <= 0) continue;
+            den += g[d];
+            if (ctx[d] == nb[3+d]) num += g[d];
+        }
+        return (den > 0) ? num / den : 0;
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  STEP 3 – CINS: Choquet Integral-based Neighbor Selection
+    // ══════════════════════════════════════════════════════════════════
+    private static float[] step3_cinsSelect(int uid, int[] ctx,
+            ArrayList<int[]> candidates,
+            Map<Integer, Map<Integer, Float>> uir,
+            Map<Integer, Float> uMeans, float gMean, double[] g) {
+        ArrayList<double[]> fdList      = new ArrayList<double[]>();
+        ArrayList<Float>    pearsonList = new ArrayList<Float>();
+        ArrayList<int[]>    validNbs    = new ArrayList<int[]>();
+        for (int[] nb : candidates) {
+            if (nb[0] == uid) continue;
+            float pearson = pearsonSim(uid, nb[0], uir, uMeans);
+            if (pearson <= 0f) continue;
+            double[] fd = new double[N_DIMS];
+            for (int d = 0; d < N_DIMS; d++) {
+                int tv = ctx[d], nv = nb[3+d];
+                fd[d] = (tv > 0 && nv > 0 && tv == nv) ? 1.0 : 0.0;
+            }
+            fdList.add(fd); pearsonList.add(pearson); validNbs.add(nb);
+        }
+        if (validNbs.isEmpty()) return new float[]{0, 0, 0};
+        double[] overall = computeOverall(fdList);
+        double[] gLocal  = computeFuzzyMeasure(fdList, pearsonList, overall, g);
+        float sumW = 0, sumWR = 0; int numN = 0;
+        for (int i = 0; i < validNbs.size(); i++) {
+            float choquet = choquetIntegral(fdList.get(i), gLocal);
+            if (choquet < EPSILON) continue;
+            float weight = pearsonList.get(i) * choquet;
+            int[] nb    = validNbs.get(i);
+            float nMean = uMeans.containsKey(nb[0]) ? uMeans.get(nb[0]) : gMean;
+            sumWR += weight * (nb[2] - nMean);
+            sumW  += Math.abs(weight);
+            numN++;
+        }
+        return new float[]{sumW, sumWR, numN};
+    }
+
+    private static double[] computeOverall(ArrayList<double[]> fdList) {
+        double[] overall = new double[N_DIMS];
+        for (double[] fd : fdList)
+            for (int d = 0; d < N_DIMS; d++) overall[d] += fd[d];
+        int n = fdList.size();
+        if (n > 0) for (int d = 0; d < N_DIMS; d++) overall[d] /= n;
+        return overall;
+    }
+
+    private static double[] computeFuzzyMeasure(ArrayList<double[]> fdList,
+            ArrayList<Float> pearsonList, double[] overall, double[] gGlobal) {
+        int M = fdList.size();
+        if (M < N_DIMS) return gGlobal;
+        double[] gLocal = new double[N_DIMS];
+        for (int d = 0; d < N_DIMS; d++)
+            gLocal[d] = Math.max(0.001, 0.5 * overall[d] + 0.5 * gGlobal[d]);
+        double lr = 0.05;
+        for (int step = 0; step < 100; step++) {
+            double[] grad = new double[N_DIMS];
+            for (int i = 0; i < M; i++) {
+                double[] fd = fdList.get(i);
+                double pred = 0;
+                for (int d = 0; d < N_DIMS; d++) pred += gLocal[d] * fd[d];
+                double err = pred - pearsonList.get(i);
+                for (int d = 0; d < N_DIMS; d++) grad[d] += 2.0 * err * fd[d];
+            }
+            for (int d = 0; d < N_DIMS; d++) {
+                gLocal[d] -= (lr / M) * grad[d];
+                gLocal[d]  = Math.max(0.001, gLocal[d]);
+            }
+        }
+        double sum = 0;
+        for (double v : gLocal) sum += v;
+        if (sum > 0) for (int d = 0; d < N_DIMS; d++) gLocal[d] /= sum;
+        else return gGlobal;
+        return gLocal;
+    }
+
+    private static float pearsonSim(int u1, int u2,
+            Map<Integer, Map<Integer, Float>> uir, Map<Integer, Float> means) {
+        Map<Integer, Float> r1 = uir.get(u1), r2 = uir.get(u2);
+        if (r1 == null || r2 == null) return 0f;
+        float m1 = means.containsKey(u1) ? means.get(u1) : DEFAULT_MEAN;
+        float m2 = means.containsKey(u2) ? means.get(u2) : DEFAULT_MEAN;
+        float sN = 0, sD1 = 0, sD2 = 0; int common = 0;
+        for (Map.Entry<Integer, Float> e : r1.entrySet()) {
+            Float v2 = r2.get(e.getKey());
+            if (v2 != null) {
+                float d1 = e.getValue() - m1, d2 = v2 - m2;
+                sN += d1*d2; sD1 += d1*d1; sD2 += d2*d2; common++;
+            }
+        }
+        if (common < 1) return 0f;
+        float den = (float)(Math.sqrt(sD1) * Math.sqrt(sD2));
+        if (den < 1e-6f) return 0f;
+        return (sN / den) * Math.min(1f, common / 6f);
+    }
+
+    private static float choquetIntegral(double[] v, double[] g) {
+        int n = v.length; if (n == 0) return 0;
+        double lam = sugenoLambda(g);
+        int[] idx = new int[n];
+        for (int i = 0; i < n; i++) idx[i] = i;
+        for (int i = 1; i < n; i++) {
+            int k = idx[i], j = i-1;
+            while (j >= 0 && v[idx[j]] > v[k]) { idx[j+1] = idx[j]; j--; }
+            idx[j+1] = k;
+        }
+        double ch = 0, prev = 0;
+        for (int i = 0; i < n; i++) {
+            double ai = v[idx[i]]; if (ai <= prev) { prev = ai; continue; }
+            int mask = 0; for (int k = i; k < n; k++) mask |= (1 << idx[k]);
+            ch += (ai - prev) * sugenoMu(mask, g, lam); prev = ai;
+        }
+        return (float) Math.max(0, Math.min(1, ch));
+    }
+
+    private static double sugenoLambda(double[] g) {
+        double s = 0; for (double gi : g) s += gi;
+        if (Math.abs(s - 1) < 1e-6) return 0;
+        double lo, hi;
+        if (s > 1) { lo = -1 + 1e-6; hi = 0; } else { lo = 0; hi = 50; }
+        for (int i = 0; i < 100; i++) {
+            double mid = (lo + hi) / 2, prod = 1;
+            for (double gi : g) prod *= (1 + mid * gi);
+            if (Math.abs(prod - 1 - mid) < 1e-10) return mid;
+            if (prod - 1 - mid > 0) hi = mid; else lo = mid;
+        }
+        return (lo + hi) / 2;
+    }
+
+    private static double sugenoMu(int mask, double[] g, double lam) {
+        if (mask == 0) return 0;
+        if (Math.abs(lam) < 1e-10) {
+            double s = 0;
+            for (int i = 0; i < g.length; i++) if ((mask & (1 << i)) != 0) s += g[i];
+            return Math.min(1, s);
+        }
+        double prod = 1;
+        for (int i = 0; i < g.length; i++) if ((mask & (1 << i)) != 0) prod *= (1 + lam * g[i]);
+        return Math.min(1, Math.max(0, (prod - 1) / lam));
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  Ranking metrics
+    // ══════════════════════════════════════════════════════════════════
+    static double precAtK(ArrayList<float[]> r, Set<Integer> rel, int k) {
+        int h = 0;
+        for (int i = 0; i < Math.min(k, r.size()); i++)
+            if (rel.contains((int) r.get(i)[0])) h++;
+        return (double) h / k;
+    }
+    static double recAtK(ArrayList<float[]> r, Set<Integer> rel, int k) {
+        if (rel.isEmpty()) return 0;
+        int h = 0;
+        for (int i = 0; i < Math.min(k, r.size()); i++)
+            if (rel.contains((int) r.get(i)[0])) h++;
+        return (double) h / rel.size();
+    }
+    static double ndcgAtK(ArrayList<float[]> r, Set<Integer> rel, int k) {
+        double dcg = 0;
+        for (int i = 0; i < Math.min(k, r.size()); i++)
+            if (rel.contains((int) r.get(i)[0])) dcg += 1.0 / (Math.log(i + 2) / Math.log(2));
+        double idcg = 0;
+        for (int i = 0; i < Math.min(k, rel.size()); i++)
+            idcg += 1.0 / (Math.log(i + 2) / Math.log(2));
+        return (idcg > 0) ? dcg / idcg : 0;
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  Data loading -- Books_rating.csv (real, possibly-quoted CSV), derives
+    //  context dims. Columns are looked up by HEADER NAME, not position.
+    // ══════════════════════════════════════════════════════════════════
+    private static ArrayList<int[]> loadData(String path) throws Exception {
+        ArrayList<int[]> all = new ArrayList<int[]>();
+        Map<String,Integer> userIds = new HashMap<String,Integer>();
+        Map<String,Integer> itemIds = new HashMap<String,Integer>();
+        int nextUser = 1, nextItem = 1;
+
+        Iterator<String[]> records = readCsvRecords(path).iterator();
+        if (!records.hasNext()) return all;
+
+        String[] header = records.next();
+        Map<String,Integer> col = new HashMap<String,Integer>();
+        for (int i = 0; i < header.length; i++) col.put(header[i].trim(), i);
+
+        int cUser = requireColumn(col, "User_id");
+        int cId = requireColumn(col, "Id");
+        int cTitle = requireColumn(col, "Title");
+        int cScore = requireColumn(col, "review/score");
+        int cTime = requireColumn(col, "review/time");
+        int cHelpful = requireColumn(col, "review/helpfulness");
+        int cSummary = requireColumn(col, "review/summary");
+        int cText = requireColumn(col, "review/text");
+        int maxCol = header.length;
+
+        while (records.hasNext()) {
+            String[] f = records.next();
+            if (f.length < maxCol) continue;
+
+            String userId = f[cUser].trim();
+            String bookId = f[cId].trim();
+            String title  = f[cTitle].trim();
+            if (userId.isEmpty() || bookId.isEmpty() || title.isEmpty()) continue;
+
+            Double score = parseDoubleSafe(f[cScore]);
+            if (score == null) continue;
+            int rating = (int) Math.round(score);
+            if (rating < 1 || rating > RATING_MAX) continue;
+
+            Integer uid = userIds.get(userId);
+            if (uid == null) { uid = nextUser++; userIds.put(userId, uid); }
+            // Item identity keyed by the product Id (ASIN-like, one per
+            // edition/ISBN), not Title: the same title can span multiple
+            // distinct editions (verified: 211 titles map to >1 Id in a
+            // 300K-row sample), and keying by Title alone merged them into
+            // artificially oversized co-rating pools that inflated accuracy.
+            Integer iid = itemIds.get(bookId);
+            if (iid == null) { iid = nextItem++; itemIds.put(bookId, iid); }
+
+            int[] row = new int[3 + N_DIMS];
+            row[0] = uid; row[1] = iid; row[2] = rating;
+
+            // -- Derived context 1/2: season + daytype from review/time (unix seconds) --
+            Double unixTime = parseDoubleSafe(f[cTime]);
+            if (unixTime != null) {
+                Calendar cal = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
+                cal.setTimeInMillis((long)(unixTime * 1000L));
+                int month = cal.get(Calendar.MONTH) + 1; // 1-12
+                int season = (month == 12 || month <= 2) ? 1 : (month <= 5) ? 2 : (month <= 8) ? 3 : 4;
+                int dow = cal.get(Calendar.DAY_OF_WEEK); // 1=Sunday..7=Saturday
+                int daytype = (dow == Calendar.SATURDAY || dow == Calendar.SUNDAY) ? 2 : 1;
+                row[3] = season;
+                row[4] = daytype;
+            } else {
+                row[3] = -1; row[4] = -1;
+            }
+
+            // -- Derived context 3: helpfulness bucket from "x/y" string --
+            int[] helpful = parseHelpfulness(f[cHelpful]);
+            if (helpful != null && helpful[1] > 0) {
+                double ratio = (double) helpful[0] / helpful[1];
+                row[5] = (ratio < 0.34) ? 1 : (ratio < 0.67) ? 2 : 3; // Low/Medium/High
+            } else {
+                row[5] = -1; // no votes recorded -- treated as missing, not zero
+            }
+
+            // -- Derived context 4: review length bucket (summary + text) --
+            int len = f[cSummary].length() + f[cText].length();
+            row[6] = (len == 0) ? -1 : (len < 100) ? 1 : (len < 400) ? 2 : 3; // Short/Medium/Long
+
+            all.add(row);
+        }
+        return all;
+    }
+
+    private static int requireColumn(Map<String,Integer> col, String name) {
+        Integer idx = col.get(name);
+        if (idx == null) throw new IllegalStateException(
+            "Expected column \"" + name + "\" not found in Books_rating.csv header: " + col.keySet());
+        return idx;
+    }
+
+    private static Double parseDoubleSafe(String s) {
+        if (s == null || s.isEmpty()) return null;
+        try { return Double.parseDouble(s.trim()); } catch (Exception ex) { return null; }
+    }
+
+    /** Parses review/helpfulness "x/y" into a 2-element int array, or null if absent/malformed. */
+    private static int[] parseHelpfulness(String s) {
+        if (s == null) return null;
+        int slash = s.indexOf('/');
+        if (slash < 0) return null;
+        try {
+            return new int[]{
+                Integer.parseInt(s.substring(0, slash).trim()),
+                Integer.parseInt(s.substring(slash + 1).trim())
+            };
+        } catch (Exception ex) { return null; }
+    }
+
+    /**
+     * Reads a CSV file into records, honoring RFC4180 quoting: fields may be
+     * wrapped in double quotes and contain embedded commas or newlines, with
+     * "" as an escaped quote inside a quoted field. Necessary here because
+     * review/summary and review/text routinely contain commas -- a naive
+     * split(",") per line would silently misalign every such row.
+     */
+    private static ArrayList<String[]> readCsvRecords(String path) throws IOException {
+        ArrayList<String[]> recs = new ArrayList<String[]>();
+        InputStream rawIn = new FileInputStream(path);
+        InputStream in = path.endsWith(".gz") ? new GZIPInputStream(rawIn) : rawIn;
+        PushbackReader br = new PushbackReader(new BufferedReader(new InputStreamReader(in, "UTF-8"), 1 << 20), 1);
+
+        ArrayList<String> fields = new ArrayList<String>();
+        StringBuilder cur = new StringBuilder();
+        boolean inQuotes = false;
+        int c;
+        while ((c = br.read()) != -1) {
+            char ch = (char) c;
+            if (inQuotes) {
+                if (ch == '"') {
+                    int next = br.read();
+                    if (next == '"') {
+                        cur.append('"');
+                    } else {
+                        inQuotes = false;
+                        if (next != -1) br.unread(next);
+                    }
+                } else {
+                    cur.append(ch);
+                }
+            } else {
+                if (ch == '"') {
+                    inQuotes = true;
+                } else if (ch == ',') {
+                    fields.add(cur.toString()); cur.setLength(0);
+                } else if (ch == '\r') {
+                    // skip; \n (if present) ends the record
+                } else if (ch == '\n') {
+                    fields.add(cur.toString()); cur.setLength(0);
+                    recs.add(fields.toArray(new String[0]));
+                    fields.clear();
+                } else {
+                    cur.append(ch);
+                }
+            }
+        }
+        if (cur.length() > 0 || !fields.isEmpty()) {
+            fields.add(cur.toString());
+            recs.add(fields.toArray(new String[0]));
+        }
+        br.close();
+        return recs;
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  Statistics
+    // ══════════════════════════════════════════════════════════════════
+    static double mean(double[] v) {
+        double s = 0; for (double x : v) s += x; return s / v.length;
+    }
+    static double std(double[] v) {
+        double m = mean(v), s = 0;
+        for (double x : v) s += (x - m) * (x - m);
+        return Math.sqrt(s / v.length);
+    }
+}
